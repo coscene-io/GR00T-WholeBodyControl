@@ -7,6 +7,7 @@ Requires the ``depthai`` SDK — install with::
 See https://docs.luxonis.com/ for hardware-specific instructions.
 """
 
+import threading
 import time
 from typing import Any
 
@@ -41,6 +42,10 @@ class OAKConfig:
     manual_focus: int = 130
     use_mjpeg: bool = False
     mjpeg_quality: int = 80
+    enable_stereo_stitch: bool = False   # U29: CAM_B+CAM_C synced side-by-side GRAY8, host JPEG, key <mount>_stereo
+    enable_depth: bool = False           # U29: on-device StereoDepth, uint16 mm PNG (RECTIFIED_LEFT), key <mount>_depth
+    depth_fps_divisor: int = 2           # publish depth every Nth frame (2 -> 15 fps at fps=30)
+    stitch_jpeg_quality: int = 80
 
 
 class OAKSensor(Sensor, SensorServer):
@@ -175,9 +180,55 @@ class OAKSensor(Sensor, SensorServer):
                     ).createOutputQueue(maxSize=3, blocking=False)
                 print("Enabled CAM_C (Monochrome Right)")
 
+        # U29: derived streams from the hardware-synced stereo pair. Their queues are NOT part of the
+        # all-cameras-present gate in read(): the pair syncs at its own cadence and depth is subsampled.
+        # U29b: their encodes run on dedicated threads — the capture loop's 33 ms budget cannot absorb
+        # the depth PNG (~23-40 ms measured on PC2); cv2 encodes release the GIL, so the threads run in parallel.
+        self._derived_lock = threading.Lock()
+        self._derived_latest = {}    # name -> (seq, capture_time, encoded bytes)
+        self._derived_emitted = {}   # name -> last seq handed to read()
+        self._derived_run = True
+        self._derived_threads = []
+        self._stitch_feed = None     # U29c: (dev_ts_l, wall_ts, jpeg_l, dev_ts_r, jpeg_r) handed over by read()
+        self._stitch_enabled = False
+        if (config.enable_stereo_stitch or config.enable_depth) and hasattr(self, "cam_mono_left") and hasattr(self, "cam_mono_right"):
+            # U29c: the OAK sits on USB2 (480 Mbps). Raw crossings are the enemy: the U29a GRAY8 pair +
+            # Sync (~18 MB/s) plus RAW16 depth @30 (~18 MB/s) saturated the link and starved EVERY stream.
+            # Stitch now happens on the host from the two mono MJPEG streams that already cross; the
+            # StereoDepth GRAY8 inputs stay device-internal and run at the subsampled depth rate.
+            if config.enable_stereo_stitch:
+                if config.use_mjpeg:
+                    self._stitch_enabled = True
+                    print("Enabled stereo stitch (host-side, from the CAM_B/CAM_C MJPEG streams)")
+                else:
+                    print("[WARN] stereo stitch requires use_mjpeg=True on this build — stitch disabled")
+            if config.enable_depth:
+                depth_fps = max(1, config.fps // max(1, config.depth_fps_divisor))
+                gray_left = self.cam_mono_left.requestOutput(
+                    config.monochrome_image_dim, dai.ImgFrame.Type.GRAY8, fps=depth_fps
+                )
+                gray_right = self.cam_mono_right.requestOutput(
+                    config.monochrome_image_dim, dai.ImgFrame.Type.GRAY8, fps=depth_fps
+                )
+                stereo = self.pipeline.create(dai.node.StereoDepth).build(
+                    left=gray_left, right=gray_right, presetMode=dai.node.StereoDepth.PresetMode.DEFAULT
+                )
+                stereo.setDepthAlign(dai.StereoDepthConfig.AlgorithmControl.DepthAlign.RECTIFIED_LEFT)
+                self.output_queues["depth"] = stereo.depth.createOutputQueue(maxSize=3, blocking=False)
+                print(f"Enabled StereoDepth (uint16 mm, RECTIFIED_LEFT, {depth_fps} fps at the source; GRAY8 inputs device-internal)")
+
         assert len(self.output_queues) > 0, "No output queues enabled"
 
         self.pipeline.start()
+
+        if self._stitch_enabled:
+            t = threading.Thread(target=self._stitch_worker, name="oak-stitch", daemon=True)
+            t.start()
+            self._derived_threads.append(t)
+        if "depth" in self.output_queues:
+            t = threading.Thread(target=self._depth_worker, name="oak-depth", daemon=True)
+            t.start()
+            self._derived_threads.append(t)
 
         print(f"[{mount_position}] Pipeline started, waiting for stabilization...")
         time.sleep(2.0)
@@ -197,6 +248,62 @@ class OAKSensor(Sensor, SensorServer):
 
         if run_as_server:
             self.start_server(port)
+
+    def _stitch_worker(self):
+        seq = 0
+        last_ts = None
+        warned = 0.0
+        while self._derived_run:
+            feed = self._stitch_feed
+            if feed is None:
+                time.sleep(0.002)
+                continue
+            lts, wall, lb, rts, rb = feed
+            if lts == last_ts:
+                time.sleep(0.002)
+                continue
+            last_ts = lts
+            skew = abs((lts - rts).total_seconds())
+            if skew > 0.010:
+                now = time.monotonic()
+                if now - warned > 10.0:
+                    print(f"[WARN] stitch pair skew {skew * 1000:.1f} ms — frame skipped")
+                    warned = now
+                continue
+            try:
+                li = cv2.imdecode(np.frombuffer(lb, np.uint8), cv2.IMREAD_GRAYSCALE)
+                ri = cv2.imdecode(np.frombuffer(rb, np.uint8), cv2.IMREAD_GRAYSCALE)
+                if li is None or ri is None:
+                    continue
+                ok, buf = cv2.imencode(
+                    ".jpg", np.hstack([li, ri]), [int(cv2.IMWRITE_JPEG_QUALITY), self.config.stitch_jpeg_quality]
+                )
+                if ok:
+                    seq += 1
+                    with self._derived_lock:
+                        self._derived_latest["stereo"] = (seq, wall, buf.tobytes())
+            except Exception as e:
+                print(f"[ERROR] stitch encode failed: {e}")
+                time.sleep(0.1)
+
+    def _depth_worker(self):
+        q = self.output_queues["depth"]
+        seq = 0
+        while self._derived_run:
+            df = q.tryGet()
+            if df is None:
+                time.sleep(0.002)
+                continue
+            try:
+                ok, buf = cv2.imencode(".png", df.getCvFrame(), [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+                if ok:
+                    cap = time.time() - (dai.Clock.now() - df.getTimestamp()).total_seconds()
+                    seq += 1
+                    with self._derived_lock:
+                        self._derived_latest["depth"] = (seq, cap, buf.tobytes())
+            except Exception as e:
+                print(f"[ERROR] depth encode failed: {e}")
+                time.sleep(0.1)
 
     def read(self) -> dict[str, Any] | None:
         if not self.pipeline.isRunning():
@@ -219,12 +326,22 @@ class OAKSensor(Sensor, SensorServer):
                 latest_frame = frame
             return latest_frame
 
-        expected_cameras = set(self.output_queues.keys())
+        def drain_wait_latest(queue, wait_s=0.006):
+            # U29e: a paced send slot must not die on a drain-empty race — the next frame of a healthy
+            # 30 fps queue is at most a few ms away. Wait for it briefly instead of dropping the slot.
+            deadline = time.monotonic() + wait_s
+            while True:
+                frame = drain_queue_get_latest(queue)
+                if frame is not None or time.monotonic() >= deadline:
+                    return frame
+                time.sleep(0.001)
+
+        expected_cameras = set(self.output_queues.keys()) - {"stereo_pair", "depth"}  # U29: derived streams never block
         received_cameras = set()
 
         if "color" in self.output_queues:
             try:
-                rgb_frame = drain_queue_get_latest(self.output_queues["color"])
+                rgb_frame = drain_wait_latest(self.output_queues["color"])
                 if rgb_frame is None:
                     return None
                 rgb_frame_time = rgb_frame.getTimestamp()
@@ -244,7 +361,7 @@ class OAKSensor(Sensor, SensorServer):
 
         if "mono_left" in self.output_queues:
             try:
-                mono_left_frame = drain_queue_get_latest(self.output_queues["mono_left"])
+                mono_left_frame = drain_wait_latest(self.output_queues["mono_left"])
                 if mono_left_frame is None:
                     return None
                 mono_left_frame_time = mono_left_frame.getTimestamp()
@@ -265,7 +382,7 @@ class OAKSensor(Sensor, SensorServer):
 
         if "mono_right" in self.output_queues:
             try:
-                mono_right_frame = drain_queue_get_latest(self.output_queues["mono_right"])
+                mono_right_frame = drain_wait_latest(self.output_queues["mono_right"])
                 if mono_right_frame is None:
                     return None
                 mono_right_frame_time = mono_right_frame.getTimestamp()
@@ -283,6 +400,21 @@ class OAKSensor(Sensor, SensorServer):
             except Exception as e:
                 print(f"[ERROR] Failed to read mono_right frame from {self.mount_position}: {e}")
                 return None
+
+        if self._stitch_enabled:  # U29c: hand the hw-synced mono pair to the stitch thread — no extra USB traffic
+            lk, rk = f"{self.mount_position}_left_mono", f"{self.mount_position}_right_mono"
+            if lk in images and rk in images:
+                self._stitch_feed = (mono_left_frame_time, timestamps[lk], images[lk], mono_right_frame_time, images[rk])
+
+        if self._derived_threads:  # U29b: pick up the encoder threads' latest results, each frame once
+            with self._derived_lock:
+                snap = dict(self._derived_latest)
+            for name, (seq, cap, payload) in snap.items():
+                if self._derived_emitted.get(name) == seq:
+                    continue
+                self._derived_emitted[name] = seq
+                images[f"{self.mount_position}_{name}"] = payload
+                timestamps[f"{self.mount_position}_{name}"] = cap
 
         if received_cameras != expected_cameras:
             missing = expected_cameras - received_cameras
@@ -329,6 +461,7 @@ class OAKSensor(Sensor, SensorServer):
         return gym.spaces.Dict(spaces)
 
     def close(self):
+        self._derived_run = False
         if self._run_as_server:
             self.stop_server()
         if hasattr(self, "pipeline") and self.pipeline.isRunning():

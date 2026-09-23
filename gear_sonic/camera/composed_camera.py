@@ -100,6 +100,15 @@ class ComposedCameraConfig:
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
+    enable_stereo_stitch: bool = False
+    """OAK oak_mono only (U29): CAM_B+CAM_C synced side-by-side GRAY8 stream, host JPEG."""
+
+    enable_depth: bool = False
+    """OAK oak_mono only (U29): on-device StereoDepth, uint16 mm PNG aligned RECTIFIED_LEFT."""
+
+    depth_fps_divisor: int = 2
+    """Publish depth every Nth frame (2 -> 15 fps at fps=30)."""
+
     def __post_init__(self):
         self.run_as_server = self.server
 
@@ -367,6 +376,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             oak_config = OAKConfig()
             oak_config.use_mjpeg = self.config.use_mjpeg
             oak_config.mjpeg_quality = self.config.mjpeg_quality
+            oak_config.enable_stereo_stitch = self.config.enable_stereo_stitch
+            oak_config.enable_depth = self.config.enable_depth
+            oak_config.depth_fps_divisor = self.config.depth_fps_divisor
             if camera_type == "oak_mono":
                 oak_config.enable_mono_cameras = True
             print(f"Initializing OAK sensor for camera type: {camera_type}")
