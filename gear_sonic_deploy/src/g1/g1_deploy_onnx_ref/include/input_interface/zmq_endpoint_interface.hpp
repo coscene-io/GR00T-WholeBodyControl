@@ -163,7 +163,8 @@ public:
         
         // Initialize streamed motion buffer (reserve large capacity for streaming)
         ResetStreamedMotion();
-        
+        motion_merger_.SetVerbose(verbose);
+
         std::cout << "[ZMQEndpointInterface] Connected to " << host << ":" << port 
                   << " topic='" << topic << "'" << std::endl;
         std::cout << "[ZMQEndpointInterface] Press ENTER to toggle between loaded motions and ZMQ stream" << std::endl;
@@ -385,7 +386,7 @@ public:
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 if (has_new_data_) {
                     has_new_data_ = false; // consumed
-                    if constexpr (DEBUG_LOGGING) {
+                    if (DEBUG_LOGGING && verbose_) {
                         std::cout << "[ZMQEndpointInterface] *** Starting ZMQ processing ***" << std::endl;
                     }
                     // Decode into a new MotionSequence with current playback position
@@ -433,19 +434,21 @@ public:
                         // Determine encode_mode based on protocol version (only once when first established)
                         // Version 1: Use encoder mode 0 (joint-based)
                         // Version 2/3: Use encoder mode 2 (SMPL-based)
-                        if constexpr (DEBUG_LOGGING) {
+                        if (DEBUG_LOGGING && verbose_) {
                             std::cout << "[ZMQEndpointInterface] active_protocol_version_=" << active_protocol_version_ << std::endl;
                             std::cout << "[ZMQEndpointInterface] result.motion->GetEncodeMode()=" << result.motion->GetEncodeMode() << std::endl;
                         }
                     
                         
                         new_motion = result.motion;
-                        std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        if (verbose_) {
+                            std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        }
                         stream_window_start_ = result.window_start;
                         frame_offset_adjustment = result.frame_offset_adjustment;
                         did_catchup = result.did_catchup_reset;
                         
-                        if constexpr (DEBUG_LOGGING) {
+                        if (DEBUG_LOGGING && verbose_) {
                             int window_end_msg_idx = stream_window_start_ + result.frame_step * (new_motion->timesteps - 1);
                             std::cout << "[ZMQEndpointInterface] Merged streamed data: " 
                                       << new_motion->timesteps << " current-rate frames, "
@@ -455,7 +458,7 @@ public:
                                       << ", did_catchup=" << did_catchup << std::endl;
                         }
                     }
-                    if constexpr (DEBUG_LOGGING) {
+                    if (DEBUG_LOGGING && verbose_) {
                         std::cout << "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***" << std::endl;
                     }
                 }
@@ -641,7 +644,7 @@ private:
         
         // Check protocol version
         int protocol_version = buffered_header_.version;
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[ZMQEndpointInterface] Protocol version: " << protocol_version << std::endl;
         }
         
@@ -753,8 +756,10 @@ private:
                                + " (chunk_size: " + std::to_string(num_frames) + ")";
                 }
             }
-            std::cout << "[ZMQEndpointInterface] Protocol v4: Received " << token_dim 
-                      << "D token (latent action), tokens[0]=" << token_data[0] << frame_info << std::endl;
+            if (verbose_) {
+                std::cout << "[ZMQEndpointInterface] Protocol v4: Received " << token_dim
+                          << "D token (latent action), tokens[0]=" << token_data[0] << frame_info << std::endl;
+            }
             
             // Store tokens in the external token state buffer (inherited from InputInterface)
             result.token_data = std::move(token_data);
@@ -841,7 +846,7 @@ private:
                 
                 if (has_left_hand_joints) {
                     left_hand_joint_.SetData(left_hand_joint_values);
-                    if constexpr (DEBUG_LOGGING) {
+                    if (DEBUG_LOGGING && verbose_) {
                         std::cout << "[ZMQEndpointInterface] Protocol v4: Left hand joints set: [";
                         for (int j = 0; j < 7; ++j) {
                             if (j > 0) std::cout << ", ";
@@ -853,7 +858,7 @@ private:
                 
                 if (has_right_hand_joints) {
                     right_hand_joint_.SetData(right_hand_joint_values);
-                    if constexpr (DEBUG_LOGGING) {
+                    if (DEBUG_LOGGING && verbose_) {
                         std::cout << "[ZMQEndpointInterface] Protocol v4: Right hand joints set: [";
                         for (int j = 0; j < 7; ++j) {
                             if (j > 0) std::cout << ", ";
@@ -1103,7 +1108,7 @@ private:
             }
         }
         
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[ZMQEndpointInterface] Decoded body quaternions: " << num_quat_bodies << " bodies per frame" << std::endl;
         }
         
@@ -1159,7 +1164,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded smpl_joints: " << num_frames 
                               << " frames, " << num_smpl_joints << " joints" << std::endl;
                 }
@@ -1218,7 +1223,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded smpl_pose: " << num_frames 
                               << " frames, " << num_smpl_poses << " poses" << std::endl;
                 }
@@ -1261,7 +1266,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded left_hand_joints: [";
                     for (int j = 0; j < 7; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1305,7 +1310,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded right_hand_joints: [";
                     for (int j = 0; j < 7; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1366,7 +1371,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded vr_position: [";
                     for (int j = 0; j < 9; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1407,7 +1412,7 @@ private:
                     }
                 }
                 
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Decoded vr_orientation: [";
                     for (int j = 0; j < 12; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1427,7 +1432,7 @@ private:
         // We always use the keyboard-controlled compliance values (g/h/b/v keys)
         // This keeps compliance control consistent across all input modes
         if (has_vr_compliance) {
-            if constexpr (DEBUG_LOGGING) {
+            if (DEBUG_LOGGING && verbose_) {
                 std::cout << "[ZMQEndpointInterface] vr_compliance field present but IGNORED (using keyboard-controlled values instead)" << std::endl;
             }
         }
@@ -1440,7 +1445,7 @@ private:
             const auto& frame_idx_field = buffered_header_.fields[frame_index_idx];
             const auto& frame_idx_buf = buffered_buffers_[frame_index_idx];
             
-            if constexpr (DEBUG_LOGGING) {
+            if (DEBUG_LOGGING && verbose_) {
                 std::cout << "[ZMQEndpointInterface] Raw message field '" << frame_idx_field.name 
                           << "' (dtype=" << frame_idx_field.dtype << ", size=" << frame_idx_buf.size() << " bytes)" << std::endl;
             }
@@ -1468,7 +1473,7 @@ private:
             }
             
             // Print frame indices for protocol v3 (SMPL actions)
-            if (protocol_version == 3 && !frame_indices.empty()) {
+            if (verbose_ && protocol_version == 3 && !frame_indices.empty()) {
                 if (frame_indices.size() == 1) {
                     std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: " 
                               << frame_indices[0] << std::endl;
@@ -1565,17 +1570,17 @@ private:
                 }
             }
             
-            if constexpr (DEBUG_LOGGING) {
+            if (DEBUG_LOGGING && verbose_) {
                 std::cout << "[ZMQEndpointInterface] catch_up field: " << (catch_up_enabled ? "true" : "false") << std::endl;
             }
         } else {
-            if constexpr (DEBUG_LOGGING) {
+            if (DEBUG_LOGGING && verbose_) {
                 std::cout << "[ZMQEndpointInterface] catch_up field not present, using default: true" << std::endl;
             }
         }
         
         // ===== DEBUG: Print merged frame indices and decoded data =====
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             // Print first 20 frames (or all frames if fewer than 20)
             int print_frames = std::min(20, num_frames);
             
@@ -1722,7 +1727,7 @@ private:
             
             if (has_left_hand_joints) {
                 left_hand_joint_.SetData(left_hand_joint_values);
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Left hand joints set: [";
                     for (int j = 0; j < 7; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1734,7 +1739,7 @@ private:
             
             if (has_right_hand_joints) {
                 right_hand_joint_.SetData(right_hand_joint_values);
-                if constexpr (DEBUG_LOGGING) {
+                if (DEBUG_LOGGING && verbose_) {
                     std::cout << "[ZMQEndpointInterface] Right hand joints set: [";
                     for (int j = 0; j < 7; ++j) {
                         if (j > 0) std::cout << ", ";
@@ -1754,7 +1759,7 @@ private:
             if (has_vr_compliance) SetVR3PointCompliance(vr_compliance_values);
             has_vr_3point_control_ = true;
             
-            if constexpr (DEBUG_LOGGING) {
+            if (DEBUG_LOGGING && verbose_) {
                 std::cout << "[ZMQEndpointInterface] VR 3-point tracking ENABLED:" << std::endl;
                 std::cout << "  Position [L|R|H]: [";
                 for (int j = 0; j < 9; ++j) {
@@ -1783,7 +1788,7 @@ private:
 
         // log the decode interval and decode time
         uint64_t decode_end_time = std::chrono::steady_clock::now().time_since_epoch().count() / 1000000; // milliseconds
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             if (last_decode_time_ > 0) {
                 uint64_t decode_time = decode_end_time - decode_start_time;
                 uint64_t time_delta = decode_end_time - last_decode_time_;
@@ -1810,10 +1815,12 @@ private:
         std::lock_guard<std::mutex> lock(data_mutex_);
         
         // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if (verbose_) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;

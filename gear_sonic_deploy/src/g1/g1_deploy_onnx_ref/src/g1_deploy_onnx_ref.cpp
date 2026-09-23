@@ -3410,9 +3410,17 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          bool waiting_now = current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_;
+          // U24b: at the live-stream edge the waiting state toggles many times per second, so an edge-triggered
+          // print still floods (09-22 on-site) — rate-limit to one line per 5 s instead.
+          static auto waiting_last_print = std::chrono::steady_clock::time_point();
+          if (waiting_now) {
             current_frame_ = current_frame_ - 1;
-            std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
+            auto now_wait = std::chrono::steady_clock::now();
+            if (now_wait - waiting_last_print >= std::chrono::seconds(5)) {
+              std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;
+              waiting_last_print = now_wait;
+            }
           }
         }
       }

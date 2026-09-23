@@ -108,7 +108,12 @@ public:
     StreamedMotionMerger() {
         Reset();
     }
-    
+
+    // Enable/disable per-merge debug output (owner passes its verbose flag through)
+    void SetVerbose(bool verbose) {
+        verbose_ = verbose;
+    }
+
     // Reset the merger state (clear all buffered data)
     void Reset() {
         streamed_motion_ = std::make_shared<MotionSequence>();
@@ -136,7 +141,7 @@ public:
         int incoming_frame_start = static_cast<int>(data.frame_indices[0]);
         int incoming_frame_end = static_cast<int>(data.frame_indices[data.num_frames - 1]);
         
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[StreamedMotionMerger] Processing " << data.num_frames << " frames, "
                       << "incoming_frame_start=" << incoming_frame_start 
                       << ", frame_step=" << frame_step << std::endl;
@@ -182,7 +187,7 @@ public:
         // Update total timesteps
         new_motion->timesteps = merge_dst_frame + data.num_frames;
         
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[StreamedMotionMerger] Merged motion: " << new_motion->timesteps 
                       << " frames (copied: " << merge_dst_frame << " + incoming: " << data.num_frames << ")" << std::endl;
         }
@@ -210,6 +215,7 @@ public:
 private:
     std::shared_ptr<MotionSequence> streamed_motion_;
     int stream_window_start_ = 0;
+    bool verbose_ = false;  ///< Runtime gate for per-merge debug prints.
     
     // Validate incoming data structure
     bool ValidateIncomingData(const IncomingData& data) const {
@@ -287,7 +293,7 @@ private:
 
         int stream_window_end = stream_window_start_ + frame_step * (streamed_motion_->timesteps - 1);
 
-        if (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[StreamedMotionMerger] incoming_frame_start: " << incoming_frame_start
                       << ", incoming_frame_end: " << incoming_frame_end
                       << ", stream_window_start_: " << stream_window_start_
@@ -404,7 +410,7 @@ private:
         int copy_dst_idx = (frame_step > 0) ? (start_offset_new / frame_step) : 0;
         int copy_count = (frame_step > 0) ? (overlap_span / frame_step) : 0;
         
-        if constexpr (DEBUG_LOGGING) {
+        if (DEBUG_LOGGING && verbose_) {
             std::cout << "[StreamedMotionMerger] Copying old data: "
                       << "global [" << overlap_start_global << ".." << (overlap_end_global-1) << "] → "
                       << "new_motion[" << copy_dst_idx << ".." << (copy_dst_idx + copy_count - 1) << "]" << std::endl;
