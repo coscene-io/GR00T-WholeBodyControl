@@ -31,10 +31,15 @@ foreach(install_path ${ROS2_INSTALL_PATHS})
   foreach(distro ${ROS2_DISTROS})
     set(ros2_include_path "${install_path}/${distro}/include")
     if(EXISTS "${ros2_include_path}")
-      set(ROS2_INCLUDE_DIRS "${ros2_include_path}")
+      # U44 2026-09-30: do NOT add the bare include root, and skip the CycloneDDS-owned dirs
+      # (dds ddsc idl idlc iceoryx*). Where apt ros-humble-cyclonedds is installed, -I <root>/dds puts
+      # dds/features.h in front of glibc <features.h> (8150 errors from __GLIBC_PREREQ), and -I <root>
+      # makes the Unitree SDK <dds/...> includes resolve to apt 0.10.5 instead of the SDK-bundled 0.10.2.
+      set(ROS2_INCLUDE_DIRS "")
       file(GLOB ROS2_INCLUDE_SUBDIRS "${ros2_include_path}/*")
       foreach(subdir ${ROS2_INCLUDE_SUBDIRS})
-        if(IS_DIRECTORY ${subdir})
+        get_filename_component(_u44_name ${subdir} NAME)
+        if(IS_DIRECTORY ${subdir} AND NOT _u44_name MATCHES "^(dds|ddsc|idl|idlc|iceoryx.*)$")
           list(APPEND ROS2_INCLUDE_DIRS ${subdir})
         endif()
       endforeach()

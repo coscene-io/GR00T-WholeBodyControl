@@ -349,3 +349,14 @@ if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
 
+
+# U44 2026-09-30: keep the Unitree SDK's bundled CycloneDDS pair (libddsc + libddscxx 0.10.2) together.
+# Where apt ros-humble-cyclonedds is installed, /opt/ros/<distro>/lib/<arch>-linux-gnu sits on
+# LD_LIBRARY_PATH (ROS setup.bash) and LD_LIBRARY_PATH beats the binary's RUNPATH, so libddsc.so.0
+# would resolve to the apt 0.10.5 build while libddscxx.so.0 stays the SDK's 0.10.2. Put the SDK
+# library directory first. No effect where apt cyclonedds is absent (the SDK copy is used anyway).
+_u44_sdk_dds="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/thirdparty/unitree_sdk2/thirdparty/lib/$(uname -m)"
+if [ -f "$_u44_sdk_dds/libddsc.so.0" ]; then
+    export LD_LIBRARY_PATH="$_u44_sdk_dds:$LD_LIBRARY_PATH"
+fi
+unset _u44_sdk_dds
