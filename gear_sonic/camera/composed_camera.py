@@ -437,7 +437,10 @@ class ComposedCameraSensor(Sensor, SensorServer):
         latest = None
         try:
             while True:
-                latest = camera_queue.get_nowait()
+                item = camera_queue.get_nowait()
+                if latest is not None:  # U43: an older frame is being replaced — count the silent discard
+                    self._u43_discards = getattr(self, "_u43_discards", 0) + 1
+                latest = item
         except queue.Empty:
             pass
         return latest
@@ -470,35 +473,54 @@ class ComposedCameraSensor(Sensor, SensorServer):
         return img_schema.serialize()
 
     def run_server(self):
-        """Main server loop — reads, serializes and publishes frames."""
-        idx = 0
-        server_start_time = time.monotonic()
+        """Main server loop — publishes each frame-set as it arrives (device-paced)."""
+        # U43 2026-09-30: event-driven send replaces the 30 Hz host-clock slot schedule.
+        # Two free-running 30 Hz clocks (device sensor vs host slots) alias: when their
+        # drifting phases cross, two frames land in one slot — the drain keeps the latest
+        # and silently discards the other — and the next slot reads empty. Result was
+        # episodic 19-27 fps windows on BOTH robots while capture stayed at 30
+        # (evidence: results/u40-u42-ego-fps-root-cause.md + the 90.62 dip 22:45:30,
+        # FPS values exactly 300/N with [P40] unchanged). Sending on arrival removes
+        # the second clock; the device paces the stream. config.fps keeps meaning as a
+        # ceiling: sends closer than half a frame interval are throttled.
         fps_print_time = time.monotonic()
         frame_interval = 1.0 / self.config.fps
+        sent = 0
+        self._u43_discards = 0
+        last_send = None
+        win_t0 = time.monotonic()
+        win = {"sent": 0, "empty": 0, "throttled": 0, "discards0": 0, "max_gap": 0.0}
 
         while True:
-            target_time = server_start_time + (idx + 1) * frame_interval
-
             message = self.read()
-            if message:
+            now = time.monotonic()
+            if not message:
+                win["empty"] += 1
+                time.sleep(0.002)
+            elif last_send is not None and now - last_send < frame_interval * 0.5:
+                win["throttled"] += 1
+            else:
                 if self.config.test_latency:
                     read_qr_code(message)
 
                 serialized_message = self.serialize_message(message)
                 self.send_message(serialized_message)
-                idx += 1
+                sent += 1
+                win["sent"] += 1
+                if last_send is not None and now - last_send > win["max_gap"]:
+                    win["max_gap"] = now - last_send
+                last_send = now
 
-                if idx % 10 == 0:
+                if sent % 10 == 0:
                     print(f"Image sending FPS: {10 / (time.monotonic() - fps_print_time):.2f}")
                     fps_print_time = time.monotonic()
 
-            current_time = time.monotonic()
-            sleep_time = target_time - current_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                if not message:
-                    idx += 1
+            if now - win_t0 >= 5.0:
+                d = self._u43_discards - win["discards0"]
+                print("[P43] send/s=%.1f queue_discard=%d empty_polls=%d throttled=%d max_send_gap=%.0fms"
+                      % (win["sent"] / (now - win_t0), d, win["empty"], win["throttled"], win["max_gap"] * 1000))
+                win_t0 = now
+                win = {"sent": 0, "empty": 0, "throttled": 0, "discards0": self._u43_discards, "max_gap": 0.0}
 
     def observation_space(self):
         try:

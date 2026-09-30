@@ -80,6 +80,10 @@ class OAKSensor(Sensor, SensorServer):
 
         print(f"Connected to OAK device: {self.device.getDeviceName(), self.device.getDeviceId()}")
         print(f"Device ID: {self.device.getDeviceId()}")
+        try:  # U40 probe: one-shot link/thermal baseline at init
+            print(f"[P40] init usb={self.device.getUsbSpeed()} temp={self.device.getChipTemperature().average:.1f}C")
+        except Exception as _e:
+            print(f"[P40] init probe unavailable: {_e}")
 
         sockets: list[dai.CameraBoardSocket] = self.device.getConnectedCameras()
         print(f"Available cameras: {[str(s) for s in sockets]}")
@@ -91,6 +95,7 @@ class OAKSensor(Sensor, SensorServer):
         # RGB camera (CAM_A)
         if config.enable_color and dai.CameraBoardSocket.CAM_A in sockets:
             self.cam_rgb = self.pipeline.create(dai.node.Camera)
+            self.cam_rgb.initialControl.setAutoExposureLimit(32000)   # U36 09-29: cap AE at 32ms so dim scenes dim the image instead of dropping below 30fps
             cam_socket = dai.CameraBoardSocket.CAM_A
             self.cam_rgb = self.cam_rgb.build(cam_socket)
 
@@ -128,6 +133,7 @@ class OAKSensor(Sensor, SensorServer):
         if config.enable_mono_cameras:
             if dai.CameraBoardSocket.CAM_B in sockets:
                 self.cam_mono_left = self.pipeline.create(dai.node.Camera)
+                self.cam_mono_left.initialControl.setAutoExposureLimit(32000)   # U36
                 cam_socket = dai.CameraBoardSocket.CAM_B
                 self.cam_mono_left = self.cam_mono_left.build(cam_socket)
 
@@ -155,6 +161,7 @@ class OAKSensor(Sensor, SensorServer):
 
             if dai.CameraBoardSocket.CAM_C in sockets:
                 self.cam_mono_right = self.pipeline.create(dai.node.Camera)
+                self.cam_mono_right.initialControl.setAutoExposureLimit(32000)   # U36
                 cam_socket = dai.CameraBoardSocket.CAM_C
                 self.cam_mono_right = self.cam_mono_right.build(cam_socket)
 
@@ -313,26 +320,61 @@ class OAKSensor(Sensor, SensorServer):
             print(f"[ERROR] OAK device disconnected for {self.mount_position}")
             return None
 
+        # U40 probe (log-only): who loses the frames — device production (devrate), XLink/queue
+        # (drainloss/gap), or the read loop (reads/s, none, disc, age_max). One [P40] line per 5 s.
+        p = getattr(self, "_p40", None)
+        if p is None:
+            p = self._p40 = {"t0": time.monotonic(), "reads": 0, "none": {}, "disc": 0,
+                             "drainloss": 0, "gap": 0, "seq0": {}, "seq": {}, "age_max": 0.0,
+                             "exp_ms": -1.0}
+        p["reads"] += 1
+
         timestamps = {}
         images = {}
         rgb_frame_time = None
 
-        def drain_queue_get_latest(queue):
+        def drain_queue_get_latest(queue, sk=None):
             latest_frame = None
+            pulled = 0
+            first_seq = last_seq = None
             while True:
                 frame = queue.tryGet()
                 if frame is None:
                     break
                 latest_frame = frame
+                pulled += 1
+                if sk is not None:
+                    try:
+                        sq = frame.getSequenceNum()
+                        if first_seq is None:
+                            first_seq = sq
+                        last_seq = sq
+                    except Exception:
+                        pass
+            if sk is not None and pulled:
+                try:
+                    p["disc"] += pulled - 1
+                    if first_seq is not None and last_seq is not None:
+                        p["drainloss"] += max(0, (last_seq - first_seq + 1) - pulled)
+                        prev = p["seq"].get(sk)
+                        if prev is not None and first_seq > prev + 1:
+                            p["gap"] += first_seq - prev - 1
+                        if sk not in p["seq0"]:
+                            p["seq0"][sk] = first_seq
+                        p["seq"][sk] = last_seq
+                except Exception:
+                    pass
             return latest_frame
 
-        def drain_wait_latest(queue, wait_s=0.006):
+        def drain_wait_latest(queue, wait_s=0.006, sk=None):
             # U29e: a paced send slot must not die on a drain-empty race — the next frame of a healthy
             # 30 fps queue is at most a few ms away. Wait for it briefly instead of dropping the slot.
             deadline = time.monotonic() + wait_s
             while True:
-                frame = drain_queue_get_latest(queue)
+                frame = drain_queue_get_latest(queue, sk)
                 if frame is not None or time.monotonic() >= deadline:
+                    if frame is None and sk is not None:
+                        p["none"][sk] = p["none"].get(sk, 0) + 1
                     return frame
                 time.sleep(0.001)
 
@@ -341,13 +383,17 @@ class OAKSensor(Sensor, SensorServer):
 
         if "color" in self.output_queues:
             try:
-                rgb_frame = drain_wait_latest(self.output_queues["color"])
+                rgb_frame = drain_wait_latest(self.output_queues["color"], sk="c")
                 if rgb_frame is None:
                     return None
                 rgb_frame_time = rgb_frame.getTimestamp()
                 read_time = time.time()
                 frame_age = (dai.Clock.now() - rgb_frame_time).total_seconds()
                 capture_time = read_time - frame_age
+                try:  # U40 probe: last color exposure, ms
+                    p["exp_ms"] = rgb_frame.getExposureTime().total_seconds() * 1000.0
+                except Exception:
+                    pass
 
                 if self._use_mjpeg:
                     images[self.mount_position] = bytes(rgb_frame.getData())
@@ -361,7 +407,7 @@ class OAKSensor(Sensor, SensorServer):
 
         if "mono_left" in self.output_queues:
             try:
-                mono_left_frame = drain_wait_latest(self.output_queues["mono_left"])
+                mono_left_frame = drain_wait_latest(self.output_queues["mono_left"], sk="l")
                 if mono_left_frame is None:
                     return None
                 mono_left_frame_time = mono_left_frame.getTimestamp()
@@ -382,7 +428,7 @@ class OAKSensor(Sensor, SensorServer):
 
         if "mono_right" in self.output_queues:
             try:
-                mono_right_frame = drain_wait_latest(self.output_queues["mono_right"])
+                mono_right_frame = drain_wait_latest(self.output_queues["mono_right"], sk="r")
                 if mono_right_frame is None:
                     return None
                 mono_right_frame_time = mono_right_frame.getTimestamp()
@@ -423,10 +469,39 @@ class OAKSensor(Sensor, SensorServer):
 
         if rgb_frame_time is not None:
             frame_age = (dai.Clock.now() - rgb_frame_time).total_seconds()
+            if frame_age > p["age_max"]:  # U40 probe
+                p["age_max"] = frame_age
             if frame_age > 0.1:
                 print(
                     f"[{self.mount_position}] OAK frame age too large: {frame_age * 1000:.1f}ms"
                 )
+
+        try:  # U40 probe: 5 s window report, then reset
+            _win = time.monotonic() - p["t0"]
+            if _win >= 5.0:
+                _rates = []
+                for _k in ("c", "l", "r"):
+                    _s0 = p["seq0"].get(_k); _s1 = p["seq"].get(_k)
+                    _rates.append("%.1f" % ((_s1 - _s0) / _win) if _s0 is not None and _s1 is not None and _s1 > _s0 else "?")
+                try:
+                    _temp = "%.1fC" % self.device.getChipTemperature().average
+                except Exception:
+                    _temp = "?"
+                try:
+                    _usb = str(self.device.getUsbSpeed()).split(".")[-1]
+                except Exception:
+                    _usb = "?"
+                _n = p["none"]
+                print("[P40] reads/s=%.1f none=c%d/l%d/r%d disc=%d drainloss=%d gap=%d devrate=%s exp=%.1fms temp=%s usb=%s age_max=%.0fms"
+                      % (p["reads"] / _win, _n.get("c", 0), _n.get("l", 0), _n.get("r", 0),
+                         p["disc"], p["drainloss"], p["gap"], "/".join(_rates),
+                         p["exp_ms"], _temp, _usb, p["age_max"] * 1000))
+                self._p40 = None
+        except Exception as _e:
+            self._p40 = None
+            if not getattr(self, "_p40_warned", False):
+                self._p40_warned = True
+                print(f"[P40] report failed ({_e}); probe continues")
 
         return {"timestamps": timestamps, "images": images}
 
