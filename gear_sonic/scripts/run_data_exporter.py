@@ -103,6 +103,35 @@ class SonicDataExporterConfig:
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
+    # coScene dual recording (all off by default = upstream behaviour)
+    keyboard_port: int = 5580
+    """ZMQ port of the start/stop source. Besides the upstream c/x keys it takes idempotent
+    'start <take id>' / 'stop <take id>' / 'discard <take id>' commands (sent by pico_record.py)."""
+
+    ignore_manager_toggles: bool = False
+    """Ignore the Manager's grip+A toggle_data_collection/toggle_data_abort flags, so the keyboard port is the
+    only start/stop source; manager_state is then read on its own CONFLATE socket (latest stream_mode only), so
+    the ~kHz manager_state stream cannot crowd pose/planner out of the 20-message queue."""
+
+    eef_zmq_port: int = 0
+    """If > 0: read the gripper from eef_zmq_tap.py on this port and add the observation.gripper /
+    action.gripper columns (NaN when no sample younger than 0.5 s)."""
+
+
+# Gripper columns from eef_zmq_tap.py (DM4310 jaw motor, rad; opening in mm; NaN = no fresh sample)
+GRIPPER_FEATURES = {
+    "observation.gripper": {
+        "dtype": "float32",
+        "shape": (4,),
+        "names": ["left_q", "right_q", "left_opening_mm", "right_opening_mm"],
+    },
+    "action.gripper": {
+        "dtype": "float32",
+        "shape": (2,),
+        "names": ["left_cmd_q", "right_cmd_q"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -227,6 +256,9 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        keyboard_port: int = 5580,
+        ignore_manager_toggles: bool = False,
+        eef_zmq_port: int = 0,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -235,7 +267,11 @@ class GrootDataCollector:
         self.robot_model = robot_model
 
         self._episode_state = EpisodeState()
-        self._keyboard_listener = ZMQKeyboardSubscriber()
+        self._keyboard_listener = ZMQKeyboardSubscriber(port=keyboard_port)
+        self._ignore_manager_toggles = ignore_manager_toggles
+        self._take_id = ""
+        self._take_t0 = None
+        self._takes_log = f"{self.data_exporter.meta.root}/coscene_takes.jsonl"
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
@@ -257,6 +293,16 @@ class GrootDataCollector:
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
+        self._manager_state_socket = None
+        self._eef_socket = None
+        self._latest_eef = None
+        if eef_zmq_port > 0:
+            self._eef_ctx = zmq.Context()
+            self._eef_socket = self._eef_ctx.socket(zmq.SUB)
+            self._eef_socket.setsockopt(zmq.CONFLATE, 1)
+            self._eef_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+            self._eef_socket.connect(f"tcp://localhost:{eef_zmq_port}")
+            print(f"[Gripper] Subscribed to eef_zmq_tap on port {eef_zmq_port}")
         try:
             self._sonic_zmq_ctx = zmq.Context()
             self._sonic_zmq_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
@@ -266,7 +312,15 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 20)
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            if ignore_manager_toggles:
+                # own socket, latest message only: stream_mode is a level, and the toggles are ignored
+                self._manager_state_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
+                self._manager_state_socket.setsockopt(zmq.CONFLATE, 1)
+                self._manager_state_socket.setsockopt(zmq.RCVTIMEO, 0)
+                self._manager_state_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+                self._manager_state_socket.connect(f"tcp://{sonic_data_zmq_host}:{sonic_data_zmq_port}")
+            else:
+                self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
             print("[Sonic] Subscribed to: pose, planner, manager_state")
@@ -308,7 +362,12 @@ class GrootDataCollector:
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
         key = self._keyboard_listener.read_msg()
+        if key and " " in key or key in ("start", "stop", "discard"):
+            self._handle_take_command(key)
+            key = None
 
+        if self._ignore_manager_toggles:
+            self._manager_toggle_da = self._manager_toggle_dc = False
         if self._manager_toggle_da:
             key = "x"
             self._manager_toggle_da = False
@@ -334,10 +393,69 @@ class GrootDataCollector:
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
 
+    def _handle_take_command(self, msg: str) -> None:
+        """Idempotent start/stop/discard from pico_record.py ('start <take id>' ...); repeats are no-ops."""
+        cmd, _, take_id = msg.partition(" ")
+        state = self._episode_state.get_state()
+        if cmd == "start" and state == self._episode_state.IDLE:
+            self._episode_state.change_state()
+            self._initial_yaw = None
+            self._take_id, self._take_t0 = take_id, time.time()
+            print(f"[Take] start episode {self.current_episode_index} take {take_id!r} at {self._take_t0:.6f}")
+        elif cmd == "stop" and state == self._episode_state.RECORDING:
+            self._episode_state.change_state()
+            t1 = time.time()
+            n = self.data_exporter.episode_buffer.get("size", 0)
+            print(f"[Take] stop episode {self.current_episode_index} take {take_id!r} at {t1:.6f}, {n} frames")
+            try:
+                with open(self._takes_log, "a") as f:
+                    f.write(json.dumps({"episode_index": int(self.current_episode_index), "take_id": self._take_id,
+                                        "start_time": self._take_t0, "stop_time": t1, "frames": int(n)}) + "\n")
+            except OSError as e:
+                print(f"[Take] could not append {self._takes_log}: {e}")
+        elif cmd == "discard" and state == self._episode_state.RECORDING:
+            self.data_exporter.save_episode_as_discarded()
+            self._episode_state.reset_state()
+            self._initial_yaw = None
+            print(f"[Take] discarded take {take_id!r}")
+
+    def _poll_eef(self) -> None:
+        if self._eef_socket is None:
+            return
+        try:
+            self._latest_eef = json.loads(self._eef_socket.recv_string(zmq.NOBLOCK))
+        except zmq.Again:
+            pass
+
+    def _add_gripper_features(self, frame_data: dict) -> None:
+        if self._eef_socket is None:
+            return
+        now = time.time()
+        obs = np.full(4, np.nan, dtype=np.float32)
+        act = np.full(2, np.nan, dtype=np.float32)
+        msg = self._latest_eef
+        if msg is not None:
+            for i, side in enumerate(("left", "right")):
+                d = msg.get(side) or {}
+                if d.get("q") is not None and now - d["t_state"] < 0.5:
+                    obs[i] = d["q"]
+                if d.get("opening_mm") is not None and now - d["t_opening"] < 0.5:
+                    obs[2 + i] = d["opening_mm"]
+                if d.get("cmd_q") is not None and now - d["t_cmd"] < 0.5:
+                    act[i] = d["cmd_q"]
+        frame_data["observation.gripper"] = obs
+        frame_data["action.gripper"] = act
+
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
         if self._sonic_zmq_socket is None:
             return
+
+        if self._manager_state_socket is not None:
+            try:
+                self._handle_manager_state(self._manager_state_socket.recv(zmq.NOBLOCK))
+            except zmq.Again:
+                pass
 
         max_polls = 20
         for _ in range(max_polls):
@@ -610,6 +728,8 @@ class GrootDataCollector:
 
         self._add_images_to_frame_data(frame_data)
 
+        self._add_gripper_features(frame_data)
+
         self._log_latency_periodic(sonic_latency_ms)
 
         self.data_exporter.add_frame(frame_data)
@@ -844,7 +964,7 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._manager_state_socket, self._eef_socket]:
             if sock is not None:
                 try:
                     sock.close()
@@ -869,6 +989,8 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
+
+                    self._poll_eef()
 
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
@@ -924,6 +1046,9 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.eef_zmq_port > 0:
+        dataset_features.update(GRIPPER_FEATURES)
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -950,6 +1075,9 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        keyboard_port=config.keyboard_port,
+        ignore_manager_toggles=config.ignore_manager_toggles,
+        eef_zmq_port=config.eef_zmq_port,
     )
     data_collector.run()
 
