@@ -39,6 +39,7 @@ from gear_sonic.data.features_sonic_vla import (
     get_wrist_camera_modality_config,
 )
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
@@ -116,6 +117,71 @@ class SonicDataExporterConfig:
     eef_zmq_port: int = 0
     """If > 0: read the gripper from eef_zmq_tap.py on this port and add the observation.gripper /
     action.gripper columns (NaN when no sample younger than 0.5 s)."""
+
+    frame_clock: bool = False
+    """Rows on a fixed 1/fps grid of the robot's clock: the loop runs on absolute deadlines, a tick it missed
+    becomes a held row (a repeat of the previous row, held=1) instead of a missing one, so row timestamp =
+    frame_index/fps stays true to wall time. Adds the columns wall_time, held, state_time, camera_time
+    (FRAME_CLOCK_FEATURES) and t0_wall to coscene_takes.jsonl. 'start/stop <take id> <unix time>' cut the
+    episode at those times (pre-roll up to 1 s, rows emitted 0.1 s behind the newest tick)."""
+
+    lean: bool = False
+    """Less CPU, same output: decode only the camera images the dataset records, and only for rows it writes
+    (nothing while idle; the robot's camera message carries three images, the dataset records one)."""
+
+    video_preset: str = ""
+    """libx264 preset of the episode video (e.g. 'veryfast'); empty = libx264's default (medium)."""
+
+    video_threads: int = 0
+    """libx264 threads; 0 = libx264's default (about 1.5 per core)."""
+
+
+# Frame-clock columns (--frame-clock); UNIX seconds on the robot's wall clock
+FRAME_CLOCK_FEATURES = {
+    # when this row's inputs were read (a held row repeats the time of the read it repeats)
+    "wall_time": {"dtype": "float64", "shape": (1,), "names": ["wall_time"]},
+    # 1 = the loop missed this tick and the row repeats the previous row (its video frame too); 0 = fresh read
+    "held": {"dtype": "int32", "shape": (1,), "names": ["held"]},
+    # the controller's stamp of the g1_debug message in this row (its receive time when the controller sends 0)
+    "state_time": {"dtype": "float64", "shape": (1,), "names": ["state_time"]},
+    # the camera server's capture stamp of the first recorded image (ego_view); NaN if the message has none.
+    # (No "image" in these names: lerobot's stats check treats every feature named *image* as a picture.)
+    "camera_time": {"dtype": "float64", "shape": (1,), "names": ["camera_time"]},
+}
+
+
+class LazyImages:
+    """The images of one camera message, each decoded on first use (--lean). The camera message carries more
+    images than the dataset records (ego_view plus two mono views on the robot), and none is needed while idle."""
+
+    def __init__(self, raw: dict):
+        self._raw = raw
+        self._decoded = {}
+
+    def __contains__(self, key) -> bool:
+        return key in self._raw
+
+    def keys(self):
+        return self._raw.keys()
+
+    def __getitem__(self, key):
+        if key not in self._decoded:
+            self._decoded[key] = ImageMessageSchema.deserialize({"images": {key: self._raw[key]}}).images[key]
+        return self._decoded[key]
+
+
+@dataclass
+class _Tick:
+    """The latest inputs as read at one tick of the frame clock (references, never copies)."""
+
+    k: int
+    wall: float
+    proprio: dict | None
+    sonic: dict | None
+    planner: dict | None
+    stream_mode: int
+    image: dict | None
+    eef: dict | None
 
 
 # Gripper columns from eef_zmq_tap.py (DM4310 jaw motor, rad; opening in mm; NaN = no fresh sample)
@@ -259,8 +325,17 @@ class GrootDataCollector:
         keyboard_port: int = 5580,
         ignore_manager_toggles: bool = False,
         eef_zmq_port: int = 0,
+        frame_clock: bool = False,
+        lean: bool = False,
     ):
         self.text_to_speech = text_to_speech
+        self._frame_clock = frame_clock
+        self._lean = lean
+        self._cmd_time = None  # boundary time carried by the last start/stop command (frame clock)
+        self._take_cmd = False  # the episode being started came from a take command (frame clock)
+        self._fc = None  # frame clock: the open episode's emission state
+        self._ticks: dict[int, _Tick] = {}  # frame clock: the last ~1 s of ticks, by tick index
+        self._k = 0  # frame clock: the newest tick
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
@@ -388,36 +463,57 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
-                self._episode_state.reset_state()
-                self._initial_yaw = None
+                self._discard_episode()
                 self._print_and_say("Discarded episode", blocking=False)
 
+    def _discard_episode(self) -> None:
+        if self._fc is not None:  # frame clock: the rows still behind the lag first, so the episode is not empty
+            self._fc_emit(self._k)
+            self._fc = None
+        self.data_exporter.save_episode_as_discarded()
+        self._episode_state.reset_state()
+        self._initial_yaw = None
+
     def _handle_take_command(self, msg: str) -> None:
-        """Idempotent start/stop/discard from pico_record.py ('start <take id>' ...); repeats are no-ops."""
+        """Idempotent start/stop/discard from pico_record.py ('start <take id> [<unix time>]' ...); repeats are
+        no-ops. The optional time is the boundary the sender asks for (its coScene request time); only the frame
+        clock uses it."""
         cmd, _, take_id = msg.partition(" ")
+        head, _, tail = take_id.rpartition(" ")
+        try:
+            t_cmd = float(tail) if head else None
+        except ValueError:
+            t_cmd = None
+        if t_cmd is not None:
+            take_id = head
         state = self._episode_state.get_state()
         if cmd == "start" and state == self._episode_state.IDLE:
             self._episode_state.change_state()
             self._initial_yaw = None
             self._take_id, self._take_t0 = take_id, time.time()
-            print(f"[Take] start episode {self.current_episode_index} take {take_id!r} at {self._take_t0:.6f}")
+            self._cmd_time, self._take_cmd = t_cmd, True
+            print(f"[Take] start episode {self.current_episode_index} take {take_id!r} at {self._take_t0:.6f}"
+                  + (f" (requested {t_cmd:.6f})" if t_cmd is not None else ""))
         elif cmd == "stop" and state == self._episode_state.RECORDING:
             self._episode_state.change_state()
             t1 = time.time()
+            self._cmd_time = t_cmd
             n = self.data_exporter.episode_buffer.get("size", 0)
-            print(f"[Take] stop episode {self.current_episode_index} take {take_id!r} at {t1:.6f}, {n} frames")
-            try:
-                with open(self._takes_log, "a") as f:
-                    f.write(json.dumps({"episode_index": int(self.current_episode_index), "take_id": self._take_id,
-                                        "start_time": self._take_t0, "stop_time": t1, "frames": int(n)}) + "\n")
-            except OSError as e:
-                print(f"[Take] could not append {self._takes_log}: {e}")
+            print(f"[Take] stop episode {self.current_episode_index} take {take_id!r} at {t1:.6f}"
+                  + (f" (requested {t_cmd:.6f})" if t_cmd is not None else f", {n} frames"))
+            if not self._frame_clock:  # the frame clock writes it once the last row is emitted
+                self._log_take({"stop_time": t1, "frames": int(n)})
         elif cmd == "discard" and state == self._episode_state.RECORDING:
-            self.data_exporter.save_episode_as_discarded()
-            self._episode_state.reset_state()
-            self._initial_yaw = None
+            self._discard_episode()
             print(f"[Take] discarded take {take_id!r}")
+
+    def _log_take(self, fields: dict) -> None:
+        try:
+            with open(self._takes_log, "a") as f:
+                f.write(json.dumps({"episode_index": int(self.current_episode_index), "take_id": self._take_id,
+                                    "start_time": self._take_t0, **fields}) + "\n")
+        except OSError as e:
+            print(f"[Take] could not append {self._takes_log}: {e}")
 
     def _poll_eef(self) -> None:
         if self._eef_socket is None:
@@ -427,10 +523,10 @@ class GrootDataCollector:
         except zmq.Again:
             pass
 
-    def _add_gripper_features(self, frame_data: dict) -> None:
+    def _add_gripper_features(self, frame_data: dict, now: float | None = None) -> None:
         if self._eef_socket is None:
             return
-        now = time.time()
+        now = time.time() if now is None else now
         obs = np.full(4, np.nan, dtype=np.float32)
         act = np.full(2, np.nan, dtype=np.float32)
         msg = self._latest_eef
@@ -691,6 +787,13 @@ class GrootDataCollector:
 
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
+        frame_data, sonic_latency_ms = self._build_frame()
+        self._log_latency_periodic(sonic_latency_ms)
+        self.data_exporter.add_frame(frame_data)
+        return self._finalize_frame(t_start)
+
+    def _build_frame(self, now: float | None = None) -> tuple[dict, float | None]:
+        """One row from the latest inputs (self.latest_*), staleness measured at ``now`` (default: now)."""
         assert self.latest_proprio_msg is not None
         proprio = self.latest_proprio_msg
 
@@ -724,16 +827,13 @@ class GrootDataCollector:
 
         self._add_cpp_state_features(frame_data, proprio)
 
-        sonic_latency_ms = self._add_sonic_pose_features(frame_data)
+        sonic_latency_ms = self._add_sonic_pose_features(frame_data, now)
 
         self._add_images_to_frame_data(frame_data)
 
-        self._add_gripper_features(frame_data)
+        self._add_gripper_features(frame_data, now)
 
-        self._log_latency_periodic(sonic_latency_ms)
-
-        self.data_exporter.add_frame(frame_data)
-        return self._finalize_frame(t_start)
+        return frame_data, sonic_latency_ms
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
         if "base_quat" in proprio:
@@ -784,9 +884,10 @@ class GrootDataCollector:
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
 
-    def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
-        """Add teleop features based on current stream mode."""
+    def _add_sonic_pose_features(self, frame_data: dict, now: float | None = None) -> float | None:
+        """Add teleop features based on current stream mode (staleness measured at ``now``, default: now)."""
         sonic_latency_ms = None
+        now = time.time() if now is None else now
 
         frame_data["teleop.stream_mode"] = np.array([self.current_stream_mode], dtype=np.int32)
 
@@ -795,7 +896,7 @@ class GrootDataCollector:
         if self.current_stream_mode in (1, 4) and smpl_msg is not None:
             receive_ts = smpl_msg.get("receive_timestamp")
             if receive_ts is not None:
-                age_sec = time.time() - receive_ts
+                age_sec = now - receive_ts
                 sonic_latency_ms = age_sec * 1000
                 self.sonic_timing_monitor.log_time_delta(age_sec)
                 if sonic_latency_ms <= 100.0:
@@ -813,7 +914,7 @@ class GrootDataCollector:
         if self.current_stream_mode == 5 and planner_msg is not None:
             receive_ts = planner_msg.get("receive_timestamp")
             if receive_ts is not None:
-                age_sec = time.time() - receive_ts
+                age_sec = now - receive_ts
                 planner_latency_ms = age_sec * 1000
                 if sonic_latency_ms is None:
                     sonic_latency_ms = planner_latency_ms
@@ -979,7 +1080,168 @@ class GrootDataCollector:
 
         self._print_and_say("Shutting down data exporter...", say=False)
 
+    def _poll_image(self) -> None:
+        if self._lean:  # keep the raw message; LazyImages decodes what a written row needs
+            msg = self._image_subscriber.receive_message_nonblocking(timeout_ms=0)
+            if msg is not None:
+                self.latest_image_msg = {"timestamps": msg.get("timestamps", {}),
+                                         "images": LazyImages(msg.get("images", {}))}
+            return
+        img_msg = self._image_subscriber.read()
+        if img_msg is not None:
+            self.latest_image_msg = img_msg
+
+    # ------------------------------------------------------------------ frame clock (--frame-clock)
+
+    @staticmethod
+    def _tick_ready(t: "_Tick | None") -> bool:
+        return t is not None and t.proprio is not None and t.image is not None
+
+    def _fc_begin(self, k: int, anchor: float) -> None:
+        """Open an episode at the tick nearest the requested start time (default: this tick)."""
+        period, t = self.loop_period, self._cmd_time
+        want = k if t is None else round((t - anchor) / period)
+        j = min(max(want, next(iter(self._ticks))), k)
+        if j != want:
+            print(f"[FrameClock] start time {t:.6f} is {(k - want) * period:.3f} s before this tick; "
+                  f"the pre-roll reaches {(k - j) * period:.3f} s")
+        self._fc = {"next": j, "stop": None, "t0": anchor + j * period, "rows": 0, "held": 0, "prev": None,
+                    "take": self._take_cmd, "start_request": t, "stop_request": None, "stop_seen": None}
+        self._take_cmd = False
+
+    def _fc_end(self, k: int, anchor: float) -> None:
+        """Close the episode before the tick nearest the requested stop time (default: after this tick)."""
+        fc, period, t = self._fc, self.loop_period, self._cmd_time
+        want = k + 1 if t is None else round((t - anchor) / period)
+        fc["stop"] = min(max(want, fc["next"]), k + 1)
+        fc["stop_request"], fc["stop_seen"] = t, time.time()
+        if fc["stop"] != want:
+            print(f"[FrameClock] stop time {t:.6f}: rows up to tick {fc['stop'] - 1} were already written "
+                  f"({fc['stop'] - want} past the requested stop)")
+
+    def _fc_emit(self, upto: int) -> None:
+        """Write the rows of ticks fc['next'] .. upto. A tick the loop missed repeats the previous row (held)."""
+        fc = self._fc
+        while fc["next"] <= upto:
+            j = fc["next"]
+            fc["next"] += 1
+            tick = self._ticks.get(j)
+            held = not self._tick_ready(tick)
+            if held:
+                tick = fc["prev"] or next(
+                    (t for t in reversed(self._ticks.values()) if t.k < j and self._tick_ready(t)), None)
+            if not self._tick_ready(tick):  # no input yet: the episode starts at a later tick
+                if fc["rows"] == 0:
+                    fc["t0"] += self.loop_period
+                continue
+            self._fc_add_row(tick, held)
+            fc["prev"] = tick
+            fc["rows"] += 1
+            fc["held"] += held
+
+    def _fc_add_row(self, tick: "_Tick", held: bool) -> None:
+        live = (self.latest_proprio_msg, self.latest_sonic_msg, self.latest_planner_msg,
+                self.current_stream_mode, self.latest_image_msg, self._latest_eef)
+        (self.latest_proprio_msg, self.latest_sonic_msg, self.latest_planner_msg,
+         self.current_stream_mode, self.latest_image_msg, self._latest_eef) = (
+            tick.proprio, tick.sonic, tick.planner, tick.stream_mode, tick.image, tick.eef)
+        try:
+            frame, sonic_latency_ms = self._build_frame(now=tick.wall)
+        finally:
+            (self.latest_proprio_msg, self.latest_sonic_msg, self.latest_planner_msg,
+             self.current_stream_mode, self.latest_image_msg, self._latest_eef) = live
+        frame["wall_time"] = np.array([tick.wall], dtype=np.float64)
+        frame["held"] = np.array([int(held)], dtype=np.int32)
+        frame["state_time"] = np.array([float(tick.proprio.get("ros_timestamp", np.nan))], dtype=np.float64)
+        frame["camera_time"] = np.array(
+            [float(tick.image.get("timestamps", {}).get(self._image_time_key, np.nan))], dtype=np.float64)
+        if not held:
+            self._log_latency_periodic(sonic_latency_ms)
+        self.data_exporter.add_frame(frame)
+
+    def _fc_finish(self) -> None:
+        fc, period = self._fc, self.loop_period
+        n = int(self.data_exporter.episode_buffer.get("size", 0))
+        print(f"[FrameClock] episode {self.current_episode_index}: {n} rows ({fc['held']} held), "
+              f"t0_wall {fc['t0']:.6f}, rows end {fc['t0'] + n * period:.6f}")
+        if fc["take"]:
+            self._log_take({"stop_time": fc["stop_seen"], "frames": n, "t0_wall": fc["t0"],
+                            "held_rows": fc["held"], "start_request": fc["start_request"],
+                            "stop_request": fc["stop_request"]})
+        self._fc = None
+        self._finalize_frame(time.monotonic())  # saves and goes back to idle
+
+    def _run_frame_clock(self):
+        """Ticks on absolute deadlines (tick k at t0 + k/fps, monotonic). Each tick reads the inputs once and
+        keeps references to them (_Tick) for ~1 s. Rows are written from the ticks `lag` ticks behind the newest
+        one, so a stop time that arrives after it still cuts exactly, and a start time from up to 1 s ago opens
+        the episode at its own tick (pre-roll). A tick the loop missed becomes a held row: rows stay one per tick,
+        so timestamp = frame_index / fps keeps matching the wall clock."""
+        period = self.loop_period
+        lag = max(2, round(0.1 * self.frequency))
+        keep = self.frequency + lag + 1
+        self._image_time_key = next((name.split(".")[-1] for name, ft in self.data_exporter.features.items()
+                                     if ft.get("dtype") in ("image", "video")), None)
+        state = self._episode_state
+        mono0 = time.monotonic()
+        k_next = 0
+        print(f"[FrameClock] {self.frequency} Hz, rows {lag} ticks behind, pre-roll {self.frequency} ticks")
+        try:
+            while True:
+                delay = mono0 + k_next * period - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                t_start = time.monotonic()
+                with self.telemetry.timer("total_loop"):
+                    with self.telemetry.timer("poll_state"):
+                        self._poll_state_zmq()
+                    with self.telemetry.timer("poll_sonic"):
+                        self._poll_sonic_zmq_messages()
+                    self._poll_eef()
+                    with self.telemetry.timer("poll_image"):
+                        self._poll_image()
+                    now_mono, now_wall = time.monotonic(), time.time()
+                    k = self._k = int((now_mono - mono0) / period)
+                    self._ticks[k] = _Tick(k, now_wall, self.latest_proprio_msg, self.latest_sonic_msg,
+                                           self.latest_planner_msg, self.current_stream_mode,
+                                           self.latest_image_msg, self._latest_eef)
+                    while next(iter(self._ticks)) < k - keep:
+                        del self._ticks[next(iter(self._ticks))]
+                    before = state.get_state()
+                    with self.telemetry.timer("check_recording_commands"):
+                        self._check_recording_commands()
+                    after = state.get_state()
+                    if after != before:
+                        anchor = now_wall - (now_mono - mono0)  # wall time of tick 0, as of this tick
+                        if after == state.RECORDING:
+                            self._fc_begin(k, anchor)
+                        elif after == state.NEED_TO_SAVE and self._fc is not None:
+                            self._fc_end(k, anchor)
+                        elif after == state.NEED_TO_SAVE:
+                            self._finalize_frame(time.monotonic())
+                        self._cmd_time = None
+                    with self.telemetry.timer("add_frame"):
+                        if self._fc is not None:
+                            stop = self._fc["stop"]
+                            self._fc_emit(k - lag if stop is None else stop - 1)
+                            if stop is not None:
+                                self._fc_finish()
+                k_next = k + 1
+                if time.monotonic() - t_start > period:
+                    self.telemetry.log_timing_info(context="Data Exporter Loop Missed", threshold=0.001)
+
+        except KeyboardInterrupt:
+            print("Data exporter terminated by user")
+            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+            if buffer_size > 0:
+                self.data_exporter.save_episode_as_discarded()
+
+        finally:
+            self.save_and_cleanup()
+
     def run(self):
+        if self._frame_clock:
+            return self._run_frame_clock()
         try:
             while True:
                 t_start = time.monotonic()
@@ -993,9 +1255,7 @@ class GrootDataCollector:
                     self._poll_eef()
 
                     with self.telemetry.timer("poll_image"):
-                        img_msg = self._image_subscriber.read()
-                        if img_msg is not None:
-                            self.latest_image_msg = img_msg
+                        self._poll_image()
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -1049,13 +1309,36 @@ def main(config: SonicDataExporterConfig):
     if config.eef_zmq_port > 0:
         dataset_features.update(GRIPPER_FEATURES)
 
+    if config.frame_clock:
+        dataset_features.update(FRAME_CLOCK_FEATURES)
+
+    video_options = {}
+    if config.video_preset:
+        video_options["preset"] = config.video_preset
+    if config.video_threads > 0:
+        video_options["threads"] = str(config.video_threads)
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
     )
 
-    data_exporter = Gr00tDataExporter.create(
+    exporter_cls = Gr00tDataExporter
+    if video_options:
+
+        class _WithVideoOptions(Gr00tDataExporter):
+            """Episode videos with the encoder options above (applied when each writer's encoder opens)."""
+
+            def create_video_writer(self):
+                writers = super().create_video_writer()
+                for writer in writers.values():
+                    writer.stream.codec_context.options = dict(video_options)
+                return writers
+
+        exporter_cls = _WithVideoOptions
+
+    data_exporter = exporter_cls.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",
         fps=config.data_collection_frequency,
         features=dataset_features,
@@ -1078,6 +1361,8 @@ def main(config: SonicDataExporterConfig):
         keyboard_port=config.keyboard_port,
         ignore_manager_toggles=config.ignore_manager_toggles,
         eef_zmq_port=config.eef_zmq_port,
+        frame_clock=config.frame_clock,
+        lean=config.lean,
     )
     data_collector.run()
 
