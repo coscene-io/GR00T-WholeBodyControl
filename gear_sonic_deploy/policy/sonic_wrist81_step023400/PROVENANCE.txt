@@ -1,0 +1,5 @@
+installed: 20260922-160747 into policy/release/ (advisor 828a55c3, user order 09-22)
+source: customer bundle sonic_wrist81_step023400_onnx_bundle.zip (sha256 fb1fe7bbfc75f765..., archived in ~/incoming-sonic_wrist81/)
+run: sonic_release_3pt_heading_thor_overheating_ankle_adaptivefix_wrist_81_from100k, exported 2026-08-19
+obs config: observation_config_sonic_v1_1.yaml (customer: "same config as v1.1")
+rollback: cd /home/unitree/GR00T-WholeBodyControl/gear_sonic_deploy/policy/release && cp model_encoder.onnx.bak-20260922-160747 model_encoder.onnx && cp model_decoder.onnx.bak-20260922-160747 model_decoder.onnx && cp observation_config.yaml.bak-20260922-160747 observation_config.yaml
